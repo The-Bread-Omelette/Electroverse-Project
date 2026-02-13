@@ -205,3 +205,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+# ---- vehicle-buffer ignores ----
+vehicle-buffer/.venv/
+vehicle-buffer/data/
+vehicle-buffer/runs/
+vehicle-buffer/videos/
+vehicle-buffer/models/*.pt
