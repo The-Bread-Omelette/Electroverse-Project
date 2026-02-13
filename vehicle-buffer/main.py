@@ -43,15 +43,12 @@ class RollingBufferWriter:
         ts = time.time()
         stamp = datetime.fromtimestamp(ts).strftime("%Y%m%d_%H%M%S")
 
-        # Close previous writer
         if self.cur_writer is not None:
             self.cur_writer.release()
 
-        # Try MP4 first
         mp4_path = os.path.join(self.out_dir, f"chunk_{stamp}.mp4")
         writer = cv2.VideoWriter(mp4_path, self.mp4_fourcc, self.fps, (self.w, self.h))
 
-        # Fallback to AVI if mp4 writer fails (very common on WSL)
         if not writer.isOpened():
             try:
                 writer.release()
@@ -121,6 +118,24 @@ def safe_crop(img, x1, y1, x2, y2):
     return crop if crop.size > 0 else None
 
 
+def sharpness_score(img_bgr) -> float:
+    """Higher = sharper (less blur)."""
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def quality_score(img_bgr) -> float:
+    """
+    Plate quality score:
+    - sharpness is key
+    - prefer bigger crops too (more pixels per character)
+    """
+    h, w = img_bgr.shape[:2]
+    area = float(h * w)
+    sharp = sharpness_score(img_bgr)
+    return sharp * (area ** 0.5)  # area^0.5 keeps it balanced
+
+
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--video", type=str, default="videos/sample.mp4", help="path to input mp4")
@@ -133,8 +148,13 @@ def parse_args():
     ap.add_argument("--car-conf", type=float, default=0.35)
     ap.add_argument("--plate-conf", type=float, default=0.35)
 
-    # If this file isn't present, Ultralytics will still try internal defaults.
     ap.add_argument("--tracker", type=str, default="bytetrack.yaml", help="bytetrack.yaml or botsort.yaml")
+
+    # Best-only saving controls
+    ap.add_argument("--best-only", action="store_true", help="Save only the best plate image per vehicle ID")
+    ap.add_argument("--min-improve", type=float, default=1.15, help="New plate must be this much better to replace old")
+  
+
     return ap.parse_args()
 
 
@@ -190,11 +210,10 @@ def main():
 
     # Tracking + counts
     seen_vehicle_ids = set()
-    log_rows = []
 
-    # Plate save throttling: avoid saving 1000 similar crops
-    last_saved_plate_ts = {}  # assoc_id -> last time saved
-    MIN_SAVE_GAP_SEC = 2.0
+    # For logging: keep ONLY final rows if best-only is enabled
+    best_plate = {}  # tid -> {"score": float, "path": str, "row": dict}
+    log_rows = []    # used when best-only is OFF
 
     frame_idx = 0
     t0 = time.time()
@@ -210,7 +229,6 @@ def main():
         if frame_idx == 1:
             print("[debug] first frame reached, writing to buffer...", flush=True)
 
-
         # 1) store raw buffer
         buffer_writer.write(frame)
 
@@ -225,7 +243,6 @@ def main():
                 verbose=False,
             )[0]
         except Exception as e:
-            # If tracker yaml causes issues, fallback to predict (no tracking)
             print(f"⚠️ track() failed ({e}). Falling back to predict() (no tracking).", flush=True)
             results = car_model.predict(
                 source=frame,
@@ -255,7 +272,7 @@ def main():
                 if tid != -1:
                     seen_vehicle_ids.add(tid)
 
-        # 3) plate detection + crop (optional)
+        # 3) plate detection + crop (only if plate_model is available)
         if plate_model is not None:
             pres = plate_model.predict(frame, conf=args.plate_conf, verbose=False)[0]
 
@@ -265,10 +282,6 @@ def main():
                     last_plate_debug = time.time()
             else:
                 pxyxy = pres.boxes.xyxy.cpu().numpy()
-
-        # ✅ ADD THIS LINE
-                print(f"[plate-debug] detected {len(pxyxy)} plates", flush=True)
-
                 pconf = pres.boxes.conf.cpu().numpy() if pres.boxes.conf is not None else None
 
                 for j in range(len(pxyxy)):
@@ -278,8 +291,6 @@ def main():
                     crop = safe_crop(frame, px1, py1, px2, py2)
                     if crop is None:
                         continue
-            
-
 
                     # associate plate -> vehicle if plate center inside a vehicle box
                     cx = (px1 + px2) / 2
@@ -290,26 +301,38 @@ def main():
                             assoc_id = tid
                             break
 
-                    ts = time.time()
-
-                    # throttle saves per vehicle id
-                    if assoc_id != -1:
-                        last_t = last_saved_plate_ts.get(assoc_id, 0.0)
-                        if (ts - last_t) < MIN_SAVE_GAP_SEC:
-                            continue
-                        last_saved_plate_ts[assoc_id] = ts
-
-                    stamp = datetime.fromtimestamp(ts).strftime("%Y%m%d_%H%M%S_%f")
-                    out_name = f"plate_{stamp}_vid{assoc_id}.jpg"
-                    out_path = os.path.join(plates_dir, out_name)
-
-                    ok_write = cv2.imwrite(out_path, crop)
-                    if not ok_write:
-                        print(f"⚠️ Failed to write plate crop: {out_path}", flush=True)
+                    # If no tracker id, skip saving (best-only needs a stable ID)
+                    if assoc_id == -1:
                         continue
 
-                    log_rows.append(
-                        {
+                    ts = time.time()
+                    stamp = datetime.fromtimestamp(ts).strftime("%Y%m%d_%H%M%S_%f")
+
+                    # ----- BEST-ONLY logic -----
+                    if args.best_only:
+                        new_score = quality_score(crop)
+                        prev = best_plate.get(assoc_id)
+
+                        # if we already have one, only replace if significantly better
+                        if prev is not None:
+                            if new_score < prev["score"] * float(args.min_improve):
+                                continue  # not better enough, skip saving
+                            # delete old best image
+                            try:
+                                if os.path.exists(prev["path"]):
+                                    os.remove(prev["path"])
+                            except Exception:
+                                pass
+
+                        out_name = f"plate_{stamp}_vid{assoc_id}.jpg"
+                        out_path = os.path.join(plates_dir, out_name)
+
+                        ok_write = cv2.imwrite(out_path, crop)
+                        if not ok_write:
+                            print(f"⚠️ Failed to write plate crop: {out_path}", flush=True)
+                            continue
+
+                        row = {
                             "timestamp": datetime.fromtimestamp(ts).isoformat(),
                             "frame": frame_idx,
                             "plate_path": out_path,
@@ -317,8 +340,32 @@ def main():
                             "associated_vehicle_id": assoc_id,
                             "vehicles_in_frame": cars_in_frame,
                             "unique_vehicles_seen": len(seen_vehicle_ids),
+                            "plate_quality_score": new_score,
                         }
-                    )
+
+                        best_plate[assoc_id] = {"score": new_score, "path": out_path, "row": row}
+
+                    # ----- Old behavior (save multiple) -----
+                    else:
+                        out_name = f"plate_{stamp}_vid{assoc_id}.jpg"
+                        out_path = os.path.join(plates_dir, out_name)
+
+                        ok_write = cv2.imwrite(out_path, crop)
+                        if not ok_write:
+                            print(f"⚠️ Failed to write plate crop: {out_path}", flush=True)
+                            continue
+
+                        log_rows.append(
+                            {
+                                "timestamp": datetime.fromtimestamp(ts).isoformat(),
+                                "frame": frame_idx,
+                                "plate_path": out_path,
+                                "plate_conf": confv,
+                                "associated_vehicle_id": assoc_id,
+                                "vehicles_in_frame": cars_in_frame,
+                                "unique_vehicles_seen": len(seen_vehicle_ids),
+                            }
+                        )
 
         # status print every ~2 seconds
         if frame_idx % max(1, int(fps * 2)) == 0:
@@ -333,18 +380,21 @@ def main():
 
     # Save log
     csv_path = os.path.join(logs_dir, "plate_log.csv")
-    pd.DataFrame(log_rows).to_csv(csv_path, index=False)
+
+    if args.best_only:
+        final_rows = [v["row"] for v in best_plate.values()]
+        pd.DataFrame(final_rows).to_csv(csv_path, index=False)
+    else:
+        pd.DataFrame(log_rows).to_csv(csv_path, index=False)
 
     print("\n✅ DONE", flush=True)
     print("Frames actually read:", frame_idx, flush=True)
     print("Chunks:", chunks_dir, flush=True)
     print("Plates:", plates_dir, flush=True)
     print("Log:", csv_path, flush=True)
+    if args.best_only:
+        print(f"Best-only saved plates (unique vehicles): {len(best_plate)}", flush=True)
 
 
 if __name__ == "__main__":
     main()
-
-
-
-
