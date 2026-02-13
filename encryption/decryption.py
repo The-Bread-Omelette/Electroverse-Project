@@ -1,10 +1,18 @@
 import os
 import json
+import time
+import uuid
+from datetime import datetime
 from Crypto.Cipher import AES
 
-ENC_FOLDER = r"E:\Clubs and other things\electroverse\encryption\data\encrypted"
-OUTPUT_FOLDER = r"E:\Clubs and other things\electroverse\encryption\data\decrypted"
+
+RAW_FOLDER = r"E:\Clubs and other things\electroverse\encryption\data\raw_buffer"
+OUT_FOLDER = r"E:\Clubs and other things\electroverse\encryption\data\encrypted"
 KEY_PATH = r"E:\Clubs and other things\electroverse\encryption\configs\secret.key"
+
+SCAN_INTERVAL = 10
+MAX_CONTAINER_DURATION = 15
+CHUNK_DURATION = 3
 
 
 def load_key():
@@ -12,103 +20,125 @@ def load_key():
         return f.read()
 
 
-def read_exact(f, size):
-    data = b""
-    while len(data) < size:
-        chunk = f.read(size - len(data))
-        if not chunk:
-            raise EOFError
-        data += chunk
-    return data
+def wait_for_stable_file(path, wait=3):
+
+    if not os.path.exists(path):
+        return False
+
+    size1 = os.path.getsize(path)
+    time.sleep(wait)
+    size2 = os.path.getsize(path)
+
+    return size1 == size2
 
 
-def unique_output_path(name):
-    base, ext = os.path.splitext(name)
-    counter = 1
-    path = os.path.join(OUTPUT_FOLDER, name)
+def create_new_container():
 
-    while os.path.exists(path):
-        path = os.path.join(
-            OUTPUT_FOLDER,
-            f"{base}_{counter}{ext}"
-        )
-        counter += 1
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    uid = uuid.uuid4().hex[:8]
+
+    name = f"container_{ts}_{uid}.WattLagGyi"
+    path = os.path.join(OUT_FOLDER, name)
+
+    header = {
+        "created_at": str(datetime.now()),
+        "container_id": uid,
+        "encryption": "AES-256-EAX",
+        "max_duration_min": MAX_CONTAINER_DURATION
+    }
+
+    header_bytes = json.dumps(header).encode()
+    header_len = len(header_bytes).to_bytes(4, "big")
+
+    with open(path, "wb") as f:
+        f.write(header_len)
+        f.write(header_bytes)
 
     return path
 
 
-def decrypt_container(container_path, key):
+def encrypt_chunk_blob(file_path, key):
 
-    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    with open(file_path, "rb") as f:
+        data = f.read()
 
-    with open(container_path, "rb") as f:
+    cipher = AES.new(key, AES.MODE_EAX)
+    ciphertext, tag = cipher.encrypt_and_digest(data)
 
-        day_header_len = int.from_bytes(read_exact(f, 4), "big")
-        day_header = json.loads(read_exact(f, day_header_len).decode())
+    file_size = len(data)
 
-        print(f"\nProcessing → {os.path.basename(container_path)}")
-        print("Header:", day_header)
+    header = {
+        "filename": os.path.basename(file_path),
+        "timestamp": str(datetime.now()),
+        "file_size": file_size,
+        "duration_min": CHUNK_DURATION
+    }
 
-        chunk_count = 0
+    header_bytes = json.dumps(header).encode()
+    header_len = len(header_bytes).to_bytes(4, "big")
 
-        while True:
-            try:
-                header_len_bytes = f.read(4)
-
-                if not header_len_bytes:
-                    break
-
-                chunk_header_len = int.from_bytes(header_len_bytes, "big")
-                chunk_header = json.loads(
-                    read_exact(f, chunk_header_len).decode()
-                )
-
-                nonce = read_exact(f, 16)
-                tag = read_exact(f, 16)
-
-                file_size = chunk_header["file_size"]
-                ciphertext = read_exact(f, file_size)
-
-                cipher = AES.new(key, AES.MODE_EAX, nonce=nonce)
-                plaintext = cipher.decrypt_and_verify(ciphertext, tag)
-
-                output_name = chunk_header["filename"]
-                output_path = unique_output_path(output_name)
-
-                with open(output_path, "wb") as out:
-                    out.write(plaintext)
-
-                chunk_count += 1
-                print(f"Decrypted → {os.path.basename(output_path)}")
-
-            except EOFError:
-                print("Reached end of container.")
-                break
-
-            except Exception as e:
-                print("Stopped at corrupted/incomplete chunk:", e)
-                break
-
-        print(f"Total chunks decrypted: {chunk_count}")
+    return (
+        header_len +
+        header_bytes +
+        cipher.nonce +
+        tag +
+        ciphertext
+    )
 
 
-def process_all_containers():
+def live_encrypt():
 
     key = load_key()
 
-    files = [
-        f for f in os.listdir(ENC_FOLDER)
-        if f.endswith(".WattLagGyi")
-    ]
+    current_container = None
+    current_duration = 0
 
-    if not files:
-        print("No containers found.")
-        return
+    print("Live encryption started...")
 
-    for file in files:
-        container_path = os.path.join(ENC_FOLDER, file)
-        decrypt_container(container_path, key)
+    while True:
+
+        files = sorted([
+            f for f in os.listdir(RAW_FOLDER)
+            if f.endswith(".mp4")
+        ])
+
+        for file in files:
+
+            full_path = os.path.join(RAW_FOLDER, file)
+
+            if not wait_for_stable_file(full_path):
+                continue
+
+            try:
+
+                if current_container is None:
+                    current_container = create_new_container()
+                    current_duration = 0
+
+                if current_duration + CHUNK_DURATION > MAX_CONTAINER_DURATION:
+                    current_container = create_new_container()
+                    current_duration = 0
+
+                blob = encrypt_chunk_blob(full_path, key)
+
+                with open(current_container, "ab") as out:
+                    out.write(blob)
+
+                current_duration += CHUNK_DURATION
+
+                os.remove(full_path)
+
+                print(
+                    f"Encrypted → {file} "
+                    f"→ {os.path.basename(current_container)} "
+                    f"({current_duration} min)"
+                )
+
+            except Exception as e:
+                print(f"Error processing {file}: {e}")
+
+        time.sleep(SCAN_INTERVAL)
 
 
 if __name__ == "__main__":
-    process_all_containers()
+    live_encrypt()
