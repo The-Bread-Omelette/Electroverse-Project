@@ -3,9 +3,8 @@ import Player from './Player.jsx'
 import './App.css'
 
 function App() {
-  const [count, setCount] = useState(0)
-
-  return <Player></Player>
+  
+  return <Player />;
 }
 
-export default App
+export default App;
