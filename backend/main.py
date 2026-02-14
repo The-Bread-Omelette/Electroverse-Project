@@ -1,10 +1,10 @@
 import threading
 import time
 
-from cv import run_cv
-from encryption import encrypt_worker
-from decryption import decrypt_worker
-from clean import cleanup_worker
+from src.record import record 
+from src.encryption.encryption import encryption
+from src.plates_detect.plates_detect import detetct_plates
+from src.server.app import server
 
 stop_event = threading.Event()
 
