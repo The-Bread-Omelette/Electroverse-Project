@@ -4,18 +4,50 @@ import gridfs
 from bson.objectid import ObjectId
 from datetime import datetime, timedelta
 import json
+import hashlib
 
 app = Flask(__name__)
 
 # 1. Connect to Mongo
 client = MongoClient("mongodb://localhost:27017/")
 db = client.video_storage_db
-# This expires the 'metadata' entry after 7 days.
+
+# TTL index for auto-deletion after 7 days
 db.fs.files.create_index("uploadDate", expireAfterSeconds=604800)
 fs = gridfs.GridFS(db)
 
-# 2. upload limit (500MB)
+# Users collection for authentication
+users_collection = db.users
+
+# 2. Upload limit (500MB)
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
+
+# ============================================
+# HELPER FUNCTIONS
+# ============================================
+
+def hash_password(password):
+    """Hash password using SHA-256"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def verify_user(username, password):
+    """Check if username and password match"""
+    if not username or not password:
+        return False
+        
+    user = users_collection.find_one({"username": username})
+    
+    if not user:
+        return False
+    
+    hashed_input = hash_password(password)
+    return user['password'] == hashed_input
+
+def get_auth_from_request():
+    """Extract username and password from request headers"""
+    username = request.headers.get('X-Username')
+    password = request.headers.get('X-Password')
+    return username, password
 
 def cleanup_orphaned_chunks():
     """Deletes data chunks that no longer have a parent file document due to TTL."""
@@ -23,58 +55,145 @@ def cleanup_orphaned_chunks():
     result = db.fs.chunks.delete_many({"files_id": {"$nin": valid_ids}})
     print(f"Cleanup: Removed {result.deleted_count} orphaned chunks.")
 
+# ============================================
+# USER MANAGEMENT ROUTES
+# ============================================
+
+def register():
+    """Register a new user"""
+    data = request.get_json()
+    
+    username = data.get('username')
+    password = data.get('password')
+    role = data.get('role', 'viewer')  # viewer, uploader, admin
+    
+    if not username or not password:
+        return jsonify({"error": "Username and password required"}), 400
+    
+    # Check if user already exists
+    if users_collection.find_one({"username": username}):
+        return jsonify({"error": "User already exists"}), 409
+    
+    # Create new user
+    user = {
+        "username": username,
+        "password": hash_password(password),
+        "role": role,
+        "created_at": datetime.utcnow()
+    }
+    
+    users_collection.insert_one(user)
+    
+    return jsonify({
+        "message": "User registered successfully",
+        "username": username,
+        "role": role
+    }), 201
+
+@app.route('/login', methods=['POST'])
+def login():
+    """Verify user credentials"""
+    data = request.get_json()
+    
+    username = data.get('username')
+    password = data.get('password')
+    
+    if verify_user(username, password):
+        user = users_collection.find_one({"username": username})
+        return jsonify({
+            "message": "Login successful",
+            "username": username,
+            "role": user['role']
+        }), 200
+    else:
+        return jsonify({"error": "Invalid credentials"}), 401
+
+# ============================================
+# VIDEO ROUTES (WITH AUTH)
+# ============================================
+
 @app.route('/')
 def home():
     return "Encrypted Video Server is Running"
 
-@app.route('/upload', methods=['POST'])
 def upload():
+    # 1. Authenticate user
+    username, password = get_auth_from_request()
+    
+    if not username or not password:
+        return jsonify({"error": "Missing authentication headers (X-Username, X-Password)"}), 401
+    
+    if not verify_user(username, password):
+        return jsonify({"error": "Authentication failed - Invalid credentials"}), 401
+    
+    # 2. Check if user has upload permission
+    user = users_collection.find_one({"username": username})
+    if user['role'] not in ['uploader', 'admin']:
+        return jsonify({"error": "No upload permission"}), 403
+    
+    # 3. Process upload
     if 'video' not in request.files:
         return jsonify({"error": "No file provided"}), 400
     
     file = request.files['video']
+    camera_id = request.form.get('camera_id', 'CAM_67')
     
-    # Capture metadata from the encryption person's script
-    # They are likely sending camera_id or other headers
-    camera_id = request.form.get('camera_id', 'CAM_67') 
-    
-    # Store as 'application/octet-stream' because it is encrypted binary, not a playable mp4 yet
     file_id = fs.put(
         file, 
         filename=file.filename, 
         content_type='application/octet-stream',
         metadata={
             "camera_id": camera_id,
-            "plate_numbers": [], # Initialize empty list for future OCR updates
+            "plate_numbers": [],
             "is_encrypted": True,
-            "container_format": "WattLagGyi"
+            "container_format": "WattLagGyi",
+            "uploaded_by": username
         }
     )
     
     return jsonify({
         "video_id": str(file_id),
-        "status": "stored_encrypted"
+        "status": "stored_encrypted",
+        "uploaded_by": username
     }), 201
 
 @app.route('/video/<video_id>')
 def stream_video(video_id):
+    # Authenticate user
+    username, password = get_auth_from_request()
+    
+    if not username or not password:
+        return jsonify({"error": "Missing authentication headers (X-Username, X-Password)"}), 401
+    
+    if not verify_user(username, password):
+        return jsonify({"error": "Authentication failed"}), 401
+    
     try:
         video_file = fs.get(ObjectId(video_id))
         
         def generate():
-            # Standard chunked streaming of the encrypted blob
-            # The client (or a middleware) will need to decrypt this
             for chunk in video_file:
                 yield chunk
 
-        # We use octet-stream because the browser cannot play this directly 
-        # until the 'encryption person's' logic decrypts it.
         return Response(generate(), mimetype='application/octet-stream')
     except Exception:
-        return "Video not found", 404
+        return jsonify({"error": "Video not found"}), 404
 
-@app.route('/update_plate/<video_id>', methods=['PATCH'])
 def update_plate(video_id):
+    # Authenticate user
+    username, password = get_auth_from_request()
+    
+    if not username or not password:
+        return jsonify({"error": "Missing authentication headers (X-Username, X-Password)"}), 401
+    
+    if not verify_user(username, password):
+        return jsonify({"error": "Authentication failed"}), 401
+    
+    # Check permission
+    user = users_collection.find_one({"username": username})
+    if user['role'] not in ['uploader', 'admin']:
+        return jsonify({"error": "No permission to update metadata"}), 403
+    
     data = request.get_json()
     plate_numbers = data.get('plate_numbers')
 
@@ -93,12 +212,19 @@ def update_plate(video_id):
 
 @app.route('/search')
 def search_videos():
-    plate = request.args.get('plate')
-    date_str = request.args.get('date') # YYYY-MM-DD
-    camera_id = request.args.get('camera_id')
+    # Authenticate user
+    username, password = get_auth_from_request()
     
-    # New Time Parameters (Format: HH:MM:SS)
-    start_time_str = request.args.get('start_time') 
+    if not username or not password:
+        return jsonify({"error": "Missing authentication headers (X-Username, X-Password)"}), 401
+    
+    if not verify_user(username, password):
+        return jsonify({"error": "Authentication failed"}), 401
+    
+    plate = request.args.get('plate')
+    date_str = request.args.get('date')
+    camera_id = request.args.get('camera_id')
+    start_time_str = request.args.get('start_time')
     end_time_str = request.args.get('end_time')
 
     query = {}
@@ -109,13 +235,10 @@ def search_videos():
     if camera_id:
         query["metadata.camera_id"] = camera_id
 
-    # Time-based filtering logic
     if date_str:
         try:
-            # 1. Establish the base date in IST
             base_date = datetime.strptime(date_str, '%Y-%m-%d')
             
-            # 2. Refine start/end window if specific times are provided
             if start_time_str and end_time_str:
                 t_start = datetime.strptime(start_time_str, '%H:%M:%S').time()
                 t_end = datetime.strptime(end_time_str, '%H:%M:%S').time()
@@ -123,11 +246,9 @@ def search_videos():
                 ist_start = datetime.combine(base_date, t_start)
                 ist_end = datetime.combine(base_date, t_end)
             else:
-                # Default to the whole day if no time is specified
                 ist_start = base_date
                 ist_end = ist_start + timedelta(days=1)
 
-            # 3. Convert IST to UTC for MongoDB Query (IST is UTC +5:30)
             utc_start = ist_start - timedelta(hours=5, minutes=30)
             utc_end = ist_end - timedelta(hours=5, minutes=30)
             
@@ -148,7 +269,8 @@ def search_videos():
             "filename": video['filename'],
             "camera_id": video.get('metadata', {}).get('camera_id'),
             "upload_date_ist": ist_time.strftime('%Y-%m-%d %H:%M:%S'),
-            "plates_found": video.get('metadata', {}).get('plate_numbers', [])
+            "plates_found": video.get('metadata', {}).get('plate_numbers', []),
+            "uploaded_by": video.get('metadata', {}).get('uploaded_by')
         })
 
     if not results:
@@ -156,8 +278,35 @@ def search_videos():
 
     return jsonify(results), 200
 
+# ============================================
+# ADMIN ROUTES
+# ============================================
+
+def list_users():
+    """List all users (admin only)"""
+    username, password = get_auth_from_request()
+    
+    # Better error message
+    if not username or not password:
+        return jsonify({
+            "error": "Missing authentication headers",
+            "required_headers": ["X-Username", "X-Password"]
+        }), 401
+    
+    if not verify_user(username, password):
+        return jsonify({"error": "Authentication failed - Invalid credentials"}), 401
+    
+    user = users_collection.find_one({"username": username})
+    if user['role'] != 'admin':
+        return jsonify({"error": "Admin access required. Your role: " + user['role']}), 403
+    
+    users = list(users_collection.find({}, {"password": 0}))
+    
+    for u in users:
+        u['_id'] = str(u['_id'])
+    
+    return jsonify(users), 200
+
 if __name__ == '__main__':
-    # Clean up any data left over from files that expired via TTL
     cleanup_orphaned_chunks()
     app.run(host='0.0.0.0', port=5000, debug=True)
-
