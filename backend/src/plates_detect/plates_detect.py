@@ -138,7 +138,7 @@ def quality_score(img_bgr) -> float:
 
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--video", type=str, default="videos/sample.mp4", help="path to input mp4")
+    ap.add_argument("--video", type=str, default="data/record.mp4", help="path to input mp4")
     ap.add_argument("--buffer-min", type=int, default=4, help="rolling buffer minutes")
     ap.add_argument("--chunk-sec", type=int, default=10, help="chunk length in seconds")
 
@@ -185,6 +185,16 @@ def main():
 
     print("Video opened:", cap.isOpened(), flush=True)
     print("FPS:", fps, flush=True)
+
+    # ✅ Processed output video writer (record.mp4 -> cv2.mp4)
+    processed_out_path = "data/cv2.mp4"
+    os.makedirs("data", exist_ok=True)
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    processed_writer = cv2.VideoWriter(processed_out_path, fourcc, float(fps), (W, H))
+
+    if not processed_writer.isOpened():
+        raise RuntimeError(f"❌ Could not open processed writer: {processed_out_path}")
 
     # Rolling buffer writer
     buffer_writer = RollingBufferWriter(
@@ -250,6 +260,12 @@ def main():
                 classes=vehicle_classes,
                 verbose=False,
             )[0]
+        # ✅ Make a processed frame (with YOLO boxes drawn)
+        processed_frame = results.plot()
+
+        # ✅ Save processed frame into cv2.mp4
+        processed_writer.write(processed_frame)
+
 
         vehicle_boxes = []
         cars_in_frame = 0
@@ -377,6 +393,8 @@ def main():
 
     cap.release()
     buffer_writer.close()
+    processed_writer.release()
+
 
     # Save log
     csv_path = os.path.join(logs_dir, "plate_log.csv")
@@ -398,3 +416,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
